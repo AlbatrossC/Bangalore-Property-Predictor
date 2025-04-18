@@ -3,8 +3,10 @@ flask-sqlalchemy
 flask-bcrypt
 flask-login
 flask-cors
+flask-migrate
 numpy
 pandas
 requests
+psycopg2-binary
 python-dotenv
 gunicorn
