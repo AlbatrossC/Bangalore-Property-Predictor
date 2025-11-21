@@ -1,372 +1,303 @@
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
-from flask_bcrypt import Bcrypt
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-import numpy as np
-import pickle
-import json
-import pandas as pd
 from flask_cors import CORS
-import requests
-import sqlite3
+from dotenv import load_dotenv
 import os
-from flask_migrate import Migrate
+import time
+import json
+import pickle
+import numpy as np
+import requests
+from sqlalchemy import text
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 
-# ======================== DATABASE CONFIGURATION ========================
-# Check if running on Render
-is_render = os.environ.get('RENDER') == 'true'
-
-# Database configuration
-if is_render:
-    # PostgreSQL configuration for Render
-    db_url = os.environ.get('DATABASE_URL')
-    if db_url.startswith('postgres://'):
-        db_url = db_url.replace('postgres://', 'postgresql://', 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
-else:
-    # SQLite configuration for local development
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
-
+# Database Configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost/banglore_property')
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key_here')
+app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET', 'dev_secret_key')
 
 db = SQLAlchemy(app)
-migrate = Migrate(app, db)  # For database migrations
-bcrypt = Bcrypt(app)
-login_manager = LoginManager(app)
-login_manager.login_view = 'login'
-login_manager.login_message_category = "info"
-NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
 CORS(app)
 
-# ======================== MODEL LOADING ========================
-model_file = "banglore_home_prices_model.pickle"
-columns_file = "columns.json"
+# --- APIs ---
+NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
 
-try:
-    if not os.path.exists(model_file):
-        raise FileNotFoundError(f"❌ Model file '{model_file}' not found.")
-    
-    if not os.path.exists(columns_file):
-        raise FileNotFoundError(f"❌ Columns file '{columns_file}' not found.")
+# --- Global Variables for ML Model ---
+model = None
+data_columns = []
+locations = []
 
-    with open(model_file, "rb") as f:
-        model = pickle.load(f)
-    
-    with open(columns_file, "r") as f:
-        data_columns = json.load(f)["data_columns"]
-
-    if len(data_columns) < 4:
-        raise ValueError("❌ Invalid data_columns format. Expected at least 4 columns (sqft, bath, bhk, property_age, locations).")
-
-    locations = data_columns[4:]
-    print(f"✅ Model and {len(locations)} locations loaded successfully!")
-
-except Exception as e:
-    print(f"❌ Error loading model: {e}")
-    model = None
-    data_columns = []
-    locations = []
-
-# ======================== DATABASE MODELS ========================
-class User(db.Model, UserMixin):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(100), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
-
-class Favorite(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    location = db.Column(db.String(100), nullable=False)
-    sqft = db.Column(db.Float, nullable=False)
-    bhk = db.Column(db.Integer, nullable=False)
-    bath = db.Column(db.Integer, nullable=False)
-    property_age = db.Column(db.Integer, nullable=False)
-    price = db.Column(db.Float, nullable=False)
-    user = db.relationship('User', backref=db.backref('favorites', lazy=True))
-
-# ======================== DATABASE HELPER FUNCTIONS ========================
-def get_db_connection():
-    """Returns the appropriate database connection based on environment"""
-    if is_render:
-        import psycopg2
-        return psycopg2.connect(os.environ.get('DATABASE_URL'))
-    else:
-        return sqlite3.connect("house_prices.db")
-
-def execute_db_query(query, params=None, fetch=True):
-    """Universal database query executor"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
+# --- Load Model ---
+def load_saved_artifacts():
+    global model, data_columns, locations
+    print("⏳ Loading model artifacts...")
     try:
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
+        path_model = "banglore_home_prices_model.pickle"
+        path_cols = "columns.json"
         
-        if fetch:
-            result = cursor.fetchall()
+        if os.path.exists(path_model) and os.path.exists(path_cols):
+            with open(path_cols, "r") as f:
+                data_columns = json.load(f)["data_columns"]
+                locations = data_columns[4:] # First 4 are numeric features
+            
+            with open(path_model, "rb") as f:
+                model = pickle.load(f)
+            print("✅ Model loaded successfully.")
         else:
-            conn.commit()
-            result = None
+            print("⚠️ Model files not found. Prediction will use fallback logic.")
     except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-    
-    return result
+        print(f"❌ Error loading artifacts: {e}")
 
-def get_location_from_db(location_name):
-    """Fetch coordinates from database"""
-    if is_render:
-        query = """
-        SELECT latitude, longitude FROM heatmap_data 
-        WHERE LOWER(TRIM(location)) = LOWER(TRIM(%s))
-        """
-    else:
-        query = """
-        SELECT latitude, longitude FROM heatmap_data 
-        WHERE TRIM(LOWER(location)) = LOWER(?)
-        """
-    
-    result = execute_db_query(query, (location_name.strip(),))
-    return result[0] if result else None
+# --- Database Models ---
+class HeatmapData(db.Model):
+    __tablename__ = 'heatmap_data'
+    id = db.Column(db.Integer, primary_key=True)
+    location = db.Column(db.String(200), nullable=False, unique=True, index=True)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
 
-def save_location_to_db(location_name, lat, lon):
-    """Saves a new location to the database"""
-    if is_render:
-        query = """
-        INSERT INTO heatmap_data (location, latitude, longitude) 
-        VALUES (%s, %s, %s)
-        """
-    else:
-        query = """
-        INSERT INTO heatmap_data (location, latitude, longitude) 
-        VALUES (?, ?, ?)
-        """
-    
-    execute_db_query(query, (location_name.strip(), lat, lon), fetch=False)
-    print(f"✅ Saved {location_name} to database!")
+# Note: User and Favorite models kept for schema compatibility but ignored for logic
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    email = db.Column(db.String(100), unique=True)
+    password = db.Column(db.String(200))
 
-# ======================== ROUTES ========================
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+# --- Helper Functions ---
+def get_location_coords_db(location_name):
+    try:
+        res = HeatmapData.query.filter(
+            db.func.lower(HeatmapData.location) == location_name.strip().lower()
+        ).first()
+        return (res.latitude, res.longitude) if res else None
+    except Exception:
+        return None
 
-@app.route("/")
-def home():
-    return render_template("app.html")
+def save_location_db(location_name, lat, lon):
+    try:
+        # Double check existence to prevent race conditions
+        exists = HeatmapData.query.filter(
+            db.func.lower(HeatmapData.location) == location_name.strip().lower()
+        ).first()
+        
+        if not exists:
+            new_loc = HeatmapData(location=location_name.strip(), latitude=lat, longitude=lon)
+            db.session.add(new_loc)
+            db.session.commit()
+            print(f"💾 Saved coordinates for: {location_name}")
+    except Exception as e:
+        db.session.rollback()
+        print(f"⚠️ DB Save Error (likely duplicate): {e}")
 
-@app.route("/get_locations", methods=["GET"])
-def get_locations():
-    return jsonify({"locations": locations})
+# --- Routes ---
 
-@app.route("/login_page")
-def login_page():
-    return render_template("login.html")
+@app.route('/')
+def index():
+    return render_template('app.html')
 
-@app.route("/register_page")
-def register_page():
-    return render_template("register.html")
+@app.route('/get_location_names')
+def get_location_names():
+    return jsonify({'locations': locations})
 
-@app.route("/predict_price", methods=["POST"])
-def predict():
+@app.route('/predict_price', methods=['POST'])
+def predict_price():
     try:
         data = request.get_json()
-        print("📥 Received Data for Prediction:", data)
+        total_sqft = float(data.get('total_sqft'))
+        location = data.get('location')
+        bhk = int(data.get('bhk'))
+        bath = int(data.get('bath'))
+        age = int(data.get('property_age', 0))
 
-        if model is None or data_columns is None:
-            return jsonify({"error": "Model or data columns not loaded."}), 500
+        if model:
+            try:
+                loc_index = data_columns.index(location.lower())
+            except:
+                loc_index = -1
 
-        features = np.zeros(len(data_columns))
-        features[data_columns.index("total_sqft")] = float(data.get("total_sqft", 0))
-        features[data_columns.index("bath")] = int(data.get("bath", 0))
-        features[data_columns.index("property_age")] = int(data.get("property_age", 0))
-        features[data_columns.index("bhk")] = int(data.get("bhk", 0))
+            x = np.zeros(len(data_columns))
+            x[0] = total_sqft
+            x[1] = bath
+            x[2] = bhk
+            x[3] = age
+            if loc_index >= 0:
+                x[loc_index] = 1
 
-        location = data.get("location", "")
-        if location in data_columns:
-            loc_index = data_columns.index(location)
-            features[loc_index] = 1
+            price = model.predict([x])[0]
         else:
-            print(f"⚠️ Location '{location}' not found in model's data columns.")
+            # Fallback logic if model is missing
+            price = (total_sqft * 5000) + (bhk * 500000)
+            
+        # Apply Tier Logic
+        tier_multipliers = {'Whitefield': 1.2, 'Indiranagar': 1.5, 'Koramangala': 1.4}
+        multiplier = tier_multipliers.get(location, 1.0)
+        final_price = max(0, price * multiplier)
 
-        prediction = model.predict([features])[0]
-        print("💰 Predicted Price:", prediction)
-
-        return jsonify({"estimated_price": round(prediction, 2)})
-
+        return jsonify({
+            'estimated_price': round(final_price, 2),
+            'details': {'location_tier_mult': multiplier}
+        })
     except Exception as e:
-        print(f"❌ Error in Prediction: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-def fetch_from_osm(location_name):
-    """Fetches coordinates from OpenStreetMap API"""
-    try:
-        response = requests.get(NOMINATIM_API_URL, params={"q": location_name, "format": "json"}, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-
-        if data:
-            lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
-            return lat, lon
-    except Exception as e:
-        print(f"🌍 OSM Fetch Error: {e}")
-    return None
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/get_location_coords", methods=["GET"])
 def get_location_coords():
     location = request.args.get("location", "").strip()
-
     if not location:
-        return jsonify({"error": "Location not provided"}), 400
+        return jsonify({"error": "Location required"}), 400
 
-    coords = get_location_from_db(location)
+    # 1. Check Database
+    coords = get_location_coords_db(location)
     if coords:
-        return jsonify({"lat": coords[0], "lon": coords[1]})
+        return jsonify({"lat": coords[0], "lon": coords[1], "source": "db"})
 
-    coords = fetch_from_osm(location)
-    if coords:
-        save_location_to_db(location, coords[0], coords[1])
-        return jsonify({"lat": coords[0], "lon": coords[1]})
+    # 2. Fetch from Nominatim (OSM)
+    try:
+        headers = {'User-Agent': 'BangalorePropPredictor/1.0'}
+        params = {'q': f"{location}, Bangalore, India", 'format': 'json', 'limit': 1}
+        response = requests.get(NOMINATIM_API_URL, params=params, headers=headers, timeout=5)
+        data = response.json()
 
-    return jsonify({"error": "Location not found"}), 404
+        if data:
+            lat, lon = float(data[0]['lat']), float(data[0]['lon'])
+            # Save to DB for future use
+            save_location_db(location, lat, lon)
+            return jsonify({"lat": lat, "lon": lon, "source": "api"})
+            
+    except Exception as e:
+        print(f"Nominatim Error: {e}")
 
-@app.route("/get_house_prices", methods=["GET"])
-def get_house_prices():
-    if is_render:
-        query = "SELECT latitude, longitude, price FROM properties"
-    else:
-        query = "SELECT latitude, longitude, price FROM properties"
-    
-    rows = execute_db_query(query)
-    house_prices = [{"lat": row[0], "lng": row[1], "price": row[2]} for row in rows]
-    return jsonify(house_prices)
-
-@app.route("/get_price_chart_data", methods=["GET"])
-def get_price_chart_data():
-    price_chart_data = {
-        "locations": ["HSR Layout", "Indiranagar", "Whitefield", "Jayanagar"],
-        "prices": [120, 150, 95, 110]
-    }
-    return jsonify(price_chart_data)
+    return jsonify({"error": "Coordinates not found"}), 404
 
 @app.route('/get_nearby_places', methods=['GET'])
 def get_nearby_places():
     lat = request.args.get('lat')
     lon = request.args.get('lon')
-    place_type = request.args.get('type')
-    
-    if not lat or not lon or not place_type:
-        return jsonify({"error": "Missing parameters"}), 400
-    
-    overpass_url = f"https://overpass-api.de/api/interpreter?data=[out:json];node[amenity={place_type}](around:2000,{lat},{lon});out;"
+    p_type = request.args.get('type', 'school') # school, hospital, mall
+    radius = request.args.get('radius', 2000)
 
+    if not lat or not lon:
+        return jsonify({'error': 'Missing lat/lon'}), 400
+
+    # Map simpler types to Overpass Key-Values
+    # We use stricter filters to avoid 400 Bad Request
+    type_map = {
+        'school': '"amenity"~"school|college|university"',
+        'hospital': '"amenity"~"hospital|clinic"',
+        'restaurant': '"amenity"~"restaurant|cafe"',
+        'mall': '"shop"~"mall|supermarket"',
+        'park': '"leisure"="park"'
+    }
+    
+    query_filter = type_map.get(p_type, f'"amenity"="{p_type}"')
+
+    # Construct Strict Overpass QL
+    # Using f-string with minimal whitespace issues
+    overpass_query = f"""
+    [out:json][timeout:25];
+    (
+      node[{query_filter}](around:{radius},{lat},{lon});
+      way[{query_filter}](around:{radius},{lat},{lon});
+      relation[{query_filter}](around:{radius},{lat},{lon});
+    );
+    out center 30;
+    """
+
+    overpass_urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter"
+    ]
+
+    places = []
+
+    # Try Overpass
+    for url in overpass_urls:
+        try:
+            print(f"🔎 Querying Overpass: {url}")
+            resp = requests.post(url, data={'data': overpass_query}, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                for el in data.get('elements', []):
+                    tags = el.get('tags', {})
+                    name = tags.get('name', 'Unnamed')
+                    
+                    # Get coords (center for ways/relations, lat/lon for nodes)
+                    if 'lat' in el:
+                        plat, plon = el['lat'], el['lon']
+                    elif 'center' in el:
+                        plat, plon = el['center']['lat'], el['center']['lon']
+                    else:
+                        continue
+                        
+                    places.append({
+                        'name': name,
+                        'lat': plat,
+                        'lon': plon,
+                        'type': p_type
+                    })
+                
+                if places:
+                    print(f"✅ Found {len(places)} places via Overpass")
+                    return jsonify({'places': places})
+            else:
+                print(f"⚠️ Overpass Error {resp.status_code}")
+                
+        except Exception as e:
+            print(f"⚠️ Overpass Exception: {e}")
+
+    # Fallback: Nominatim (if Overpass fails)
+    print("⚠️ Switching to Nominatim Fallback")
     try:
-        response = requests.get(overpass_url)
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch data from Overpass API"}), 500
-
-        data = response.json()
-        places = []
-        for element in data.get('elements', []):
-            if 'lat' in element and 'lon' in element and 'tags' in element:
-                places.append({
-                    "name": element['tags'].get('name', 'Unknown'),
-                    "lat": element['lat'],
-                    "lon": element['lon']
-                })
-
-        return jsonify({"places": places})
-
+        headers = {'User-Agent': 'BangalorePropPredictor/1.0'}
+        # Viewbox is approx 2km box
+        viewbox_delta = 0.02 
+        params = {
+            'q': f"{p_type}",
+            'format': 'json',
+            'limit': 20,
+            'viewbox': f"{float(lon)-viewbox_delta},{float(lat)+viewbox_delta},{float(lon)+viewbox_delta},{float(lat)-viewbox_delta}",
+            'bounded': 1
+        }
+        resp = requests.get(NOMINATIM_API_URL, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        for item in data:
+            places.append({
+                'name': item.get('display_name', '').split(',')[0],
+                'lat': float(item['lat']),
+                'lon': float(item['lon']),
+                'type': p_type
+            })
     except Exception as e:
-        print(f"Error fetching nearby places: {e}")
-        return jsonify({"error": "Request failed"}), 500
+        print(f"Nominatim Fallback Error: {e}")
 
-@app.route("/save_favorite", methods=["POST"])
-@login_required
-def save_favorite():
-    data = request.get_json()
-    new_fav = Favorite(
-        user_id=current_user.id,
-        location=data["location"],
-        sqft=data["sqft"],
-        bhk=data["bhk"],
-        bath=data["bath"],
-        property_age=data["propertyAge"],
-        price=data["price"]
-    )
-    db.session.add(new_fav)
-    db.session.commit()
-    return jsonify({"message": "Property saved to favorites!"})
+    return jsonify({'places': places})
 
-@app.route("/get_favorites", methods=["GET"])
-@login_required
-def get_favorites():
-    favorites = Favorite.query.filter_by(user_id=current_user.id).all()
-    fav_list = [{
-        "id": fav.id,
-        "location": fav.location,
-        "sqft": fav.sqft,
-        "bhk": fav.bhk,
-        "bath": fav.bath,
-        "property_age": fav.property_age,
-        "price": fav.price
-    } for fav in favorites]
-    return jsonify({"favorites": fav_list})
-
-@app.route("/delete_favorite/<int:fav_id>", methods=["DELETE"])
-@login_required
-def delete_favorite(fav_id):
-    favorite = Favorite.query.get_or_404(fav_id)
-    if favorite.user_id != current_user.id:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    db.session.delete(favorite)
-    db.session.commit()
-    return jsonify({"message": "Favorite deleted successfully"})
-
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    existing_user = User.query.filter_by(email=data["email"]).first()
-    if existing_user:
-        return jsonify({"error": "User already exists"}), 400
-
-    hashed_password = bcrypt.generate_password_hash(data["password"]).decode('utf-8')
-    new_user = User(name=data["name"], email=data["email"], password=hashed_password)
-    db.session.add(new_user)
-    db.session.commit()
-    return jsonify({"message": "User registered successfully!"})
-
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json()
-    user = User.query.filter_by(email=data["email"]).first()
-
-    if user and bcrypt.check_password_hash(user.password, data["password"]):
-        login_user(user)
-        return jsonify({"message": "Login successful", "user": user.name})
-    return jsonify({"error": "Invalid email or password"}), 401
-
-@app.route("/logout")
-@login_required
-def logout():
-    logout_user()
-    return jsonify({"message": "Logged out successfully"})
-
-@app.route("/check_session", methods=["GET"])
-def check_session():
-    if current_user.is_authenticated:
-        return jsonify({"logged_in": True, "user": current_user.name})
-    return jsonify({"logged_in": False})
-
+# --- Application Startup ---
 if __name__ == "__main__":
+    load_saved_artifacts()
+    
     with app.app_context():
         db.create_all()
-    app.run(debug=not is_render)  # Disable debug mode in production
+        
+        # -----------------------------------------------------------
+        # 🔥 CRITICAL FIX FOR: duplicate key value violates unique constraint
+        # This syncs the Postgres sequence with the actual data ID
+        # -----------------------------------------------------------
+        try:
+            print("🔧 Syncing Database ID Sequence...")
+            db.session.execute(text("SELECT setval('heatmap_data_id_seq', COALESCE((SELECT MAX(id)+1 FROM heatmap_data), 1), false);"))
+            db.session.commit()
+            print("✅ Database Sequence Synced.")
+        except Exception as e:
+            print(f"ℹ️ Sequence sync note: {e}")
+            db.session.rollback()
+        # -----------------------------------------------------------
+
+    port = int(os.getenv('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
