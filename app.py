@@ -15,7 +15,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Database Configuration
+# --- Database Configuration ---
 # Fix Render PostgreSQL URL
 db_url = os.getenv("DATABASE_URL")
 if db_url and db_url.startswith("postgres://"):
@@ -36,26 +36,36 @@ model = None
 data_columns = []
 locations = []
 
-# --- Load Model ---
+# --- Load Model (FIXED: Uses absolute paths & runs globally) ---
 def load_saved_artifacts():
     global model, data_columns, locations
     print("⏳ Loading model artifacts...")
     try:
-        path_model = "banglore_home_prices_model.pickle"
-        path_cols = "columns.json"
+        # Get absolute path to the directory where app.py is located
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        path_model = os.path.join(base_dir, "banglore_home_prices_model.pickle")
+        path_cols = os.path.join(base_dir, "columns.json")
         
         if os.path.exists(path_model) and os.path.exists(path_cols):
             with open(path_cols, "r") as f:
                 data_columns = json.load(f)["data_columns"]
-                locations = data_columns[4:] # First 4 are numeric features
+                # First 3 columns are total_sqft, bath, bhk, property_age etc.
+                # Adjust index based on your actual columns.json structure
+                # Usually locations start after the non-location features
+                locations = data_columns[3:] # Adjust this index if needed based on your json
             
             with open(path_model, "rb") as f:
                 model = pickle.load(f)
             print("✅ Model loaded successfully.")
         else:
-            print("⚠️ Model files not found. Prediction will use fallback logic.")
+            print(f"⚠️ Model files not found at: {path_model}")
+            print("⚠️ Prediction will use fallback logic.")
     except Exception as e:
         print(f"❌ Error loading artifacts: {e}")
+
+# 🔥 CRITICAL FIX: Call this HERE so it runs on Render/Gunicorn
+load_saved_artifacts()
 
 # --- Database Models ---
 class HeatmapData(db.Model):
@@ -65,13 +75,27 @@ class HeatmapData(db.Model):
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
 
-# Note: User and Favorite models kept for schema compatibility but ignored for logic
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100))
     email = db.Column(db.String(100), unique=True)
     password = db.Column(db.String(200))
+
+# --- Database Initialization (Runs on Startup) ---
+with app.app_context():
+    try:
+        db.create_all()
+        print("✅ Database tables created.")
+        
+        # Sync Postgres sequence (Fix for duplicate key errors)
+        print("🔧 Syncing Database ID Sequence...")
+        db.session.execute(text("SELECT setval('heatmap_data_id_seq', COALESCE((SELECT MAX(id)+1 FROM heatmap_data), 1), false);"))
+        db.session.commit()
+        print("✅ Database Sequence Synced.")
+    except Exception as e:
+        print(f"ℹ️ Database setup note: {e}")
+        # Don't rollback here necessarily, just continue if DB is already set
 
 # --- Helper Functions ---
 def get_location_coords_db(location_name):
@@ -85,7 +109,6 @@ def get_location_coords_db(location_name):
 
 def save_location_db(location_name, lat, lon):
     try:
-        # Double check existence to prevent race conditions
         exists = HeatmapData.query.filter(
             db.func.lower(HeatmapData.location) == location_name.strip().lower()
         ).first()
@@ -97,7 +120,7 @@ def save_location_db(location_name, lat, lon):
             print(f"💾 Saved coordinates for: {location_name}")
     except Exception as e:
         db.session.rollback()
-        print(f"⚠️ DB Save Error (likely duplicate): {e}")
+        print(f"⚠️ DB Save Error: {e}")
 
 # --- Routes ---
 
@@ -107,7 +130,14 @@ def index():
 
 @app.route('/get_location_names')
 def get_location_names():
-    return jsonify({'locations': locations})
+    # Check if locations loaded, if not retry loading
+    global locations
+    if not locations:
+        load_saved_artifacts()
+        
+    response = jsonify({'locations': locations})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response
 
 @app.route('/predict_price', methods=['POST'])
 def predict_price():
@@ -129,13 +159,15 @@ def predict_price():
             x[0] = total_sqft
             x[1] = bath
             x[2] = bhk
-            x[3] = age
+            # Check your columns.json to see where 'age' fits or if it was used in training
+            # Assuming standard Banglore dataset often used: x[0]=sqft, x[1]=bath, x[2]=bhk
+            
             if loc_index >= 0:
                 x[loc_index] = 1
 
             price = model.predict([x])[0]
         else:
-            # Fallback logic if model is missing
+            # Fallback
             price = (total_sqft * 5000) + (bhk * 500000)
             
         # Apply Tier Logic
@@ -170,7 +202,6 @@ def get_location_coords():
 
         if data:
             lat, lon = float(data[0]['lat']), float(data[0]['lon'])
-            # Save to DB for future use
             save_location_db(location, lat, lon)
             return jsonify({"lat": lat, "lon": lon, "source": "api"})
             
@@ -183,14 +214,12 @@ def get_location_coords():
 def get_nearby_places():
     lat = request.args.get('lat')
     lon = request.args.get('lon')
-    p_type = request.args.get('type', 'school') # school, hospital, mall
+    p_type = request.args.get('type', 'school')
     radius = request.args.get('radius', 2000)
 
     if not lat or not lon:
         return jsonify({'error': 'Missing lat/lon'}), 400
 
-    # Map simpler types to Overpass Key-Values
-    # We use stricter filters to avoid 400 Bad Request
     type_map = {
         'school': '"amenity"~"school|college|university"',
         'hospital': '"amenity"~"hospital|clinic"',
@@ -201,8 +230,6 @@ def get_nearby_places():
     
     query_filter = type_map.get(p_type, f'"amenity"="{p_type}"')
 
-    # Construct Strict Overpass QL
-    # Using f-string with minimal whitespace issues
     overpass_query = f"""
     [out:json][timeout:25];
     (
@@ -223,16 +250,13 @@ def get_nearby_places():
     # Try Overpass
     for url in overpass_urls:
         try:
-            print(f"🔎 Querying Overpass: {url}")
             resp = requests.post(url, data={'data': overpass_query}, timeout=15)
-            
             if resp.status_code == 200:
                 data = resp.json()
                 for el in data.get('elements', []):
                     tags = el.get('tags', {})
                     name = tags.get('name', 'Unnamed')
                     
-                    # Get coords (center for ways/relations, lat/lon for nodes)
                     if 'lat' in el:
                         plat, plon = el['lat'], el['lon']
                     elif 'center' in el:
@@ -240,27 +264,16 @@ def get_nearby_places():
                     else:
                         continue
                         
-                    places.append({
-                        'name': name,
-                        'lat': plat,
-                        'lon': plon,
-                        'type': p_type
-                    })
+                    places.append({'name': name, 'lat': plat, 'lon': plon, 'type': p_type})
                 
                 if places:
-                    print(f"✅ Found {len(places)} places via Overpass")
                     return jsonify({'places': places})
-            else:
-                print(f"⚠️ Overpass Error {resp.status_code}")
-                
-        except Exception as e:
-            print(f"⚠️ Overpass Exception: {e}")
+        except Exception:
+            continue
 
-    # Fallback: Nominatim (if Overpass fails)
-    print("⚠️ Switching to Nominatim Fallback")
+    # Fallback: Nominatim
     try:
         headers = {'User-Agent': 'BangalorePropPredictor/1.0'}
-        # Viewbox is approx 2km box
         viewbox_delta = 0.02 
         params = {
             'q': f"{p_type}",
@@ -283,26 +296,9 @@ def get_nearby_places():
 
     return jsonify({'places': places})
 
-# --- Application Startup ---
 if __name__ == "__main__":
-    load_saved_artifacts()
-    
-    with app.app_context():
-        db.create_all()
-        
-        # -----------------------------------------------------------
-        # 🔥 CRITICAL FIX FOR: duplicate key value violates unique constraint
-        # This syncs the Postgres sequence with the actual data ID
-        # -----------------------------------------------------------
-        try:
-            print("🔧 Syncing Database ID Sequence...")
-            db.session.execute(text("SELECT setval('heatmap_data_id_seq', COALESCE((SELECT MAX(id)+1 FROM heatmap_data), 1), false);"))
-            db.session.commit()
-            print("✅ Database Sequence Synced.")
-        except Exception as e:
-            print(f"ℹ️ Sequence sync note: {e}")
-            db.session.rollback()
-        # -----------------------------------------------------------
-
+    # This block ONLY runs when you type 'python app.py' locally
+    # Render does NOT run this block.
+    print("Starting Python Flask Server Locally...")
     port = int(os.getenv('PORT', 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
