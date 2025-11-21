@@ -16,7 +16,12 @@ load_dotenv()
 app = Flask(__name__)
 
 # Database Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost/banglore_property')
+# Fix Render PostgreSQL URL
+db_url = os.getenv("DATABASE_URL")
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url or 'postgresql://postgres:password@localhost/banglore_property'
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET', 'dev_secret_key')
 
